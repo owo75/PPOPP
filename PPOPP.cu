@@ -15,7 +15,6 @@
 #include "ppopp.h"
 #include <algorithm>
 #include <thrust/transform.h>
-#include "HouseholdermixedMGSTSQR.h"
 
 
 
@@ -419,29 +418,39 @@ int main(int argc,char *argv[])
         panel_width = std::min(panel_width, (long int)(double_rank - accumulated_rank));
         if (panel_height <= 0 || panel_width <= 0) break;
 
-        const long int block_num_tsqr = (panel_height + TSQR_BLOCK_SIZE - 1) / TSQR_BLOCK_SIZE;
-        const int ldwork_tsqr = block_num_tsqr * panel_width;
         thrust::device_vector<double> d_R_tsqr(panel_width * panel_width);
         double* d_R_tsqr_ptr = thrust::raw_pointer_cast(d_R_tsqr.data());
-        thrust::device_vector<double> d_tsqr_work(static_cast<size_t>(ldwork_tsqr) * panel_width);
-        double* d_tsqr_work_ptr = thrust::raw_pointer_cast(d_tsqr_work.data());
         double* d_panel_ptr = d_A_ptr + col_start * m + row_start;
+        thrust::device_vector<double> d_tau(panel_width);
+        double* d_tau_ptr = thrust::raw_pointer_cast(d_tau.data());
+        thrust::device_vector<int> d_devInfo(1);
+        int* d_devInfo_ptr = thrust::raw_pointer_cast(d_devInfo.data());
 
-        tsqr_hh_mgs<double>(cublasHandle,
-                           panel_height,
-                           panel_width,
-                           d_panel_ptr,
-                           m,
-                           d_R_tsqr_ptr,
-                           panel_width,
-                           d_tsqr_work_ptr,
-                           ldwork_tsqr);
-        
+        int lwork_geqrf = 0;
+        int lwork_orgqr = 0;
+        cusolverDnDgeqrf_bufferSize(cusolverHandle, panel_height, panel_width,
+                                    d_panel_ptr, m, &lwork_geqrf);
+        cusolverDnDorgqr_bufferSize(cusolverHandle, panel_height, panel_width, panel_width,
+                                    d_panel_ptr, m, d_tau_ptr, &lwork_orgqr);
+        int lwork_qr = std::max(lwork_geqrf, lwork_orgqr);
+        thrust::device_vector<double> d_qr_work(lwork_qr);
+        double* d_qr_work_ptr = thrust::raw_pointer_cast(d_qr_work.data());
+
+        cusolverDnDgeqrf(cusolverHandle, panel_height, panel_width,
+                         d_panel_ptr, m,
+                         d_tau_ptr,
+                         d_qr_work_ptr, lwork_qr,
+                         d_devInfo_ptr);
         dim3 threads_R_extract(16, 16);
         dim3 blocks_R_extract((panel_width + 15) / 16, (panel_width + 15) / 16);
         extract_upper_triangle_kernel<<<blocks_R_extract, threads_R_extract>>>(d_R_tsqr_ptr, panel_width,
-                                                                               d_R_tsqr_ptr, panel_width,
+                                                                               d_panel_ptr, m,
                                                                                panel_width, panel_width);
+        cusolverDnDorgqr(cusolverHandle, panel_height, panel_width, panel_width,
+                         d_panel_ptr, m,
+                         d_tau_ptr,
+                         d_qr_work_ptr, lwork_qr,
+                         d_devInfo_ptr);
        
         thrust::device_vector<double> diag_elements_gpu(panel_width);
         extractDiagonal<<<(panel_width + 255) / 256, 256>>>(thrust::raw_pointer_cast(diag_elements_gpu.data()),
@@ -547,12 +556,12 @@ int main(int argc,char *argv[])
         thrust::device_vector<double> d_getrf_work(lwork_getrf);
         double* d_getrf_work_ptr = thrust::raw_pointer_cast(d_getrf_work.data());
         thrust::device_vector<int> devInfo_getrf(1);
-        int* d_devInfo_ptr = thrust::raw_pointer_cast(devInfo_getrf.data());
+        int* d_devInfo_getrf_ptr = thrust::raw_pointer_cast(devInfo_getrf.data());
 
         cusolverDnDgetrf(cusolverHandle, panel_height, new_panel_width,
                          d_B_ptr, panel_height,
                          d_getrf_work_ptr, NULL,
-                         d_devInfo_ptr);
+                         d_devInfo_getrf_ptr);
 
         cudaMemset(d_Y_ptr, 0, panel_height * new_panel_width * sizeof(double));
         dim3 threads_for_L(16, 16); 
